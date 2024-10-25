@@ -1,20 +1,14 @@
 package armory
 
 import (
-	"context"
 	"crypto/tls"
-	"fmt"
-	"log"
-	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/monitor/azquery"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/monitor/armmonitor"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	hclog "github.com/hashicorp/go-hclog"
-	"github.com/spf13/viper"
 
 	"github.com/privateerproj/privateer-sdk/raidengine"
 	"github.com/privateerproj/privateer-sdk/utils"
@@ -27,19 +21,23 @@ type ABS struct {
 	Results map[string]raidengine.StrikeResult // Optional, allows cross referencing between strikes
 }
 
-var (
-	storageAccountUri        string
-	token                    azcore.AccessToken
-	cred                     *azidentity.DefaultAzureCredential
-	subscriptionId           string
-	storageAccountResourceId string
-	storageAccountResource   armresources.GenericResource
-	logsClient               *azquery.LogsClient
-	armMonitorClientFactory  *armmonitor.ClientFactory
-)
-
-func init() {
+type StorageAccount struct {
+	Id       string
+	Uri      string
+	Resource armresources.GenericResource
 }
+
+type GlobalVars struct {
+	storageAccount          StorageAccount
+	subscriptionId          string
+	token                   azcore.AccessToken
+	cred                    *azidentity.DefaultAzureCredential
+	logsClient              *azquery.LogsClient
+	armMonitorClientFactory *armmonitor.ClientFactory
+	err                     error
+}
+
+var globals GlobalVars
 
 func (a *ABS) SetLogger(loggerName string) hclog.Logger {
 	a.Log = raidengine.GetLogger(loggerName, false)
@@ -47,79 +45,15 @@ func (a *ABS) SetLogger(loggerName string) hclog.Logger {
 }
 
 func (a *ABS) GetTactics() map[string][]raidengine.Strike {
-
-	// Get subscription ID
-	subscriptionId = viper.GetString("raids.ABS.subscriptionId")
-	if valid, err := ValidateVariableValue(subscriptionId, `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`); !valid {
-		log.Fatalf("Subscription ID variable validation failed with error: %s", err)
-	}
-
-	// Get storage account resource ID
-	storageAccountResourceId = viper.GetString("raids.ABS.storageAccountResourceId")
-	if valid, err := ValidateVariableValue(storageAccountResourceId, `^/subscriptions/[0-9a-fA-F-]+/resourceGroups/[a-zA-Z0-9-_()]+/providers/Microsoft\.Storage/storageAccounts/[a-z0-9]+$`); !valid {
-		log.Fatalf("Storage Account Resource ID variable validation failed with error: %s", err)
-	}
-
-	// Get an Azure credential
-	var err error
-	cred, err = azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		log.Fatalf("Failed to get Azure credential: %v", err)
-	}
-
-	// Create an Azure resources client
-	client, err := armresources.NewClient(subscriptionId, cred, nil)
-	if err != nil {
-		log.Fatalf("Failed to create Azure resources client: %v", err)
-	}
-
-	// Get storage account resource
-	getResourceResult, err := client.GetByID(context.Background(), storageAccountResourceId, "2021-04-01", nil)
-	// TODO: Set context with timeout and appropriate cancellation
-	if err != nil {
-		log.Fatalf("Failed to get storage account resource: %v", err)
-	} else if *getResourceResult.GenericResource.Type != "Microsoft.Storage/storageAccounts" {
-		log.Fatalf("Resource ID provided is not a storage account")
-	}
-
-	storageAccountResource = getResourceResult.GenericResource
-
-	// Get storage account URI
-	storageAccountUri = storageAccountResource.Properties.(map[string]interface{})["primaryEndpoints"].(map[string]interface{})["blob"].(string)
-
-	// Get a logs client
-	logsClient, err = azquery.NewLogsClient(cred, nil)
-	if err != nil {
-		log.Fatalf("Failed to create Azure logs client: %v", err)
-	}
-
-	// Get a client factory for ARM monitor
-	armMonitorClientFactory, err = armmonitor.NewClientFactory(subscriptionId, cred, nil)
-	if err != nil {
-		log.Fatalf("Failed to create Azure monitor client factory: %v", err)
-	}
-
 	return a.Tactics
 }
 
-func GetToken(result *raidengine.MovementResult) string {
-	if token.Token == "" || token.ExpiresOn.Before(time.Now().Add(-5*time.Minute)) {
-
-		log.Default().Printf("Getting new access token")
-		var err error
-		token, err = cred.GetToken(context.Background(), policy.TokenRequestOptions{
-			Scopes: []string{"https://storage.azure.com/.default"},
-		})
-		if err != nil {
-			result.Message = fmt.Sprintf("Failed to get access token: %v", err)
-			return ""
-		}
-
-		return token.Token
+// Initialize is the first thing to run after the plugin's logger is set
+func (a *ABS) Initialize() error {
+	if globals.err != nil {
+		return globals.err
 	}
-
-	log.Default().Printf("Using existing access token")
-	return token.Token
+	return nil
 }
 
 func StrikeResultSetter(successMessage string, failureMessage string, result *raidengine.StrikeResult) {
@@ -172,13 +106,13 @@ func CCC_C01_TR01_T01() (result raidengine.MovementResult) {
 	}
 
 	// Get access token
-	token := GetToken(&result)
+	token := globals.getToken(&result)
 	if token == "" {
 		return
 	}
 
 	// Check TLS version of response
-	CheckTLSVersion(storageAccountUri, token, &result)
+	CheckTLSVersion(globals.getStorageAccount().Uri, token, &result)
 	if !result.Passed {
 		return
 	}
@@ -217,7 +151,7 @@ func CCC_C01_TR02_T01() (result raidengine.MovementResult) {
 		Function:    utils.CallerPath(0),
 	}
 
-	ConfirmHTTPRequestFails(storageAccountUri, &result)
+	ConfirmHTTPRequestFails(globals.getStorageAccount().Uri, &result)
 
 	return
 }
@@ -257,7 +191,7 @@ func CCC_C01_TR03_T01() (result raidengine.MovementResult) {
 
 	tlsVersion := tls.VersionTLS10
 
-	ConfirmOutdatedProtocolRequestsFail(storageAccountUri, &result, tlsVersion)
+	ConfirmOutdatedProtocolRequestsFail(globals.getStorageAccount().Uri, &result, tlsVersion)
 	return
 }
 
@@ -269,7 +203,7 @@ func CCC_C01_TR03_T02() (result raidengine.MovementResult) {
 
 	tlsVersion := tls.VersionTLS11
 
-	ConfirmOutdatedProtocolRequestsFail(storageAccountUri, &result, tlsVersion)
+	ConfirmOutdatedProtocolRequestsFail(globals.getStorageAccount().Uri, &result, tlsVersion)
 	return
 }
 

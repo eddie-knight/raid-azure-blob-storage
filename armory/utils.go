@@ -1,6 +1,7 @@
 package armory
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net/http"
@@ -8,17 +9,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/monitor/azquery"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/monitor/armmonitor"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/privateerproj/privateer-sdk/raidengine"
+	"github.com/privateerproj/privateer-sdk/utils"
 )
 
 func ValidateVariableValue(variableValue string, regex string) (bool, error) {
-	// Check if variable is populated
-	if variableValue == "" {
-		return false, fmt.Errorf("variable is required and not populated")
-	}
-
 	// Check if variable matches regex
 	matched, err := regexp.MatchString(regex, variableValue)
+
 	if err != nil {
 		return false, fmt.Errorf("validation of variable has failed with message: %s", err)
 	}
@@ -118,13 +121,13 @@ func CheckTLSVersion(endpoint string, token string, result *raidengine.MovementR
 func ConfirmHTTPRequestFails(endpoint string, result *raidengine.MovementResult) {
 	httpUrl := strings.Replace(endpoint, "https", "http", 1)
 	response := MakeGETRequest(httpUrl, "", result, nil, nil)
-
-	if response.StatusCode == 400 && strings.Contains(response.Status, "http") {
-		result.Passed = true
-		result.Message = "HTTP requests are not supported"
-	} else {
-		result.Passed = false
-		result.Message = "HTTP requests are supported"
+	if result.Passed {
+		if response.StatusCode == 400 && strings.Contains(response.Status, "http") {
+			result.Message = "HTTP requests are not supported"
+		} else {
+			result.Passed = false
+			result.Message = "HTTP requests are supported"
+		}
 	}
 }
 
@@ -144,4 +147,101 @@ func ConfirmOutdatedProtocolRequestsFail(endpoint string, result *raidengine.Mov
 			result.Message = fmt.Sprintf("Insecure TLS version %s is supported", tls.VersionName(uint16(tlsVersion)))
 		}
 	}
+}
+
+/* GlobalVars Lazy Loaders */
+
+func (g *GlobalVars) getCred() *azidentity.DefaultAzureCredential {
+	if g.cred == nil {
+		var err error
+		g.cred, err = azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			g.err = fmt.Errorf("failed to get Azure credential: %v", err)
+		}
+	}
+	return g.cred
+}
+
+func (g *GlobalVars) getToken(result *raidengine.MovementResult) string {
+	if g.token.Token == "" || g.token.ExpiresOn.Before(time.Now().Add(-5*time.Minute)) {
+		var err error
+		g.token, err = g.getCred().GetToken(context.Background(), policy.TokenRequestOptions{
+			Scopes: []string{"https://storage.azure.com/.default"},
+		})
+		if err != nil {
+			result.Message = fmt.Sprintf("Failed to get access token: %v", err)
+			return ""
+		}
+	}
+	return g.token.Token
+}
+
+func (g *GlobalVars) getStorageAccount() StorageAccount {
+	if g.storageAccount.Id == "" {
+		// Get storage account resource ID
+		g.storageAccount.Id = utils.GetRequiredString("raids.ABS.storageAccountResourceId", nil)
+		if valid, err := ValidateVariableValue(g.storageAccount.Id, `^/subscriptions/[0-9a-fA-F-]+/resourceGroups/[a-zA-Z0-9-_()]+/providers/Microsoft\.Storage/storageAccounts/[a-z0-9]+$`); !valid {
+			g.err = fmt.Errorf("storage Account Resource ID variable validation failed with error: %s", err)
+		}
+		g.storageAccount.Resource = g.newStorageAccountResource()
+		if g.storageAccount.Resource.Properties != nil {
+			g.storageAccount.Uri = g.storageAccount.Resource.Properties.(map[string]interface{})["primaryEndpoints"].(map[string]interface{})["blob"].(string)
+		} else {
+			g.err = fmt.Errorf("storage account resource not found or is malformed")
+		}
+	}
+	return g.storageAccount
+}
+
+func (g *GlobalVars) newStorageAccountResource() armresources.GenericResource {
+	// Get storage account resource
+	client, err := armresources.NewClient(g.getSubscriptionId(), g.getCred(), nil)
+	if err != nil {
+		g.err = fmt.Errorf("failed to create Azure resources client: %v", err)
+	}
+
+	// Get storage account resource
+	getResourceResult, err := client.GetByID(context.Background(), g.storageAccount.Id, "2021-04-01", nil)
+	// TODO: Set context with timeout and appropriate cancellation
+	if err != nil {
+		g.err = fmt.Errorf("failed to get storage account resource: %v", err)
+	} else if *getResourceResult.GenericResource.Type != "Microsoft.Storage/storageAccounts" {
+		g.err = fmt.Errorf("resource ID provided is not a storage account")
+	}
+
+	return getResourceResult.GenericResource
+}
+
+func (g *GlobalVars) getSubscriptionId() string {
+	if g.subscriptionId == "" {
+		g.subscriptionId = utils.GetRequiredString("raids.ABS.subscriptionId", nil)
+		if valid, err := ValidateVariableValue(g.subscriptionId, `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`); !valid {
+			g.err = fmt.Errorf("subscription ID variable validation failed with error: %s", err)
+		}
+	}
+	return g.subscriptionId
+}
+
+func (g *GlobalVars) getArmMonitorClientFactory() *armmonitor.ClientFactory {
+	if g.armMonitorClientFactory != nil {
+		return g.armMonitorClientFactory
+	}
+	// Get a client factory for ARM monitor
+	armMonitorClientFactory, err := armmonitor.NewClientFactory(g.getSubscriptionId(), g.getCred(), nil)
+	if err != nil {
+		g.err = fmt.Errorf("failed to create Azure monitor client factory: %v", err)
+	}
+	return armMonitorClientFactory
+}
+
+func (g *GlobalVars) getLogsClient() *azquery.LogsClient {
+	if g.logsClient != nil {
+		return g.logsClient
+	}
+	// Get a logs client
+	logsClient, err := azquery.NewLogsClient(g.getCred(), nil)
+	if err != nil {
+		g.err = fmt.Errorf("failed to create Azure logs client: %v", err)
+	}
+	return logsClient
 }

@@ -10,7 +10,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/monitor/azquery"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/monitor/armmonitor"
 	"github.com/privateerproj/privateer-sdk/raidengine"
 	"github.com/privateerproj/privateer-sdk/utils"
 )
@@ -53,19 +52,20 @@ func CCC_C04_TR01_T01() (result raidengine.MovementResult) {
 		Function:    utils.CallerPath(0),
 	}
 
-	storageAccountBlobResourceId := storageAccountResourceId + "/blobServices/default"
-	confirmLoggingToLogAnalyticsIsConfigured(storageAccountBlobResourceId, armMonitorClientFactory, &result)
+	storageAccountBlobResourceId := globals.getStorageAccount().Id + "/blobServices/default"
+	confirmLoggingToLogAnalyticsIsConfigured(storageAccountBlobResourceId, &result)
 	return
 }
 
 func CCC_C04_TR01_T02() (result raidengine.MovementResult) {
+	storageAccount := globals.getStorageAccount()
 	result = raidengine.MovementResult{
 		Description: "This movement tests that a successful login attempt is logged",
 		Function:    utils.CallerPath(0),
 	}
 
-	token := GetToken(&result)
-	response := MakeGETRequest(storageAccountUri, token, &result, nil, nil)
+	token := globals.getToken(&result)
+	response := MakeGETRequest(storageAccount.Uri, token, &result, nil, nil)
 
 	if response.StatusCode != http.StatusOK {
 		result.Passed = false
@@ -73,17 +73,18 @@ func CCC_C04_TR01_T02() (result raidengine.MovementResult) {
 		return
 	}
 
-	confirmHTTPResponseIsLogged(response, storageAccountResourceId, logsClient, &result)
+	confirmHTTPResponseIsLogged(response, storageAccount.Id, globals.getLogsClient(), &result)
 	return
 }
 
 func CCC_C04_TR01_T03() (result raidengine.MovementResult) {
+	storageAccount := globals.getStorageAccount()
 	result = raidengine.MovementResult{
 		Description: "This movement tests that a failed login attempt is logged",
 		Function:    utils.CallerPath(0),
 	}
 
-	response := MakeGETRequest(storageAccountUri, "", &result, nil, nil)
+	response := MakeGETRequest(storageAccount.Uri, "", &result, nil, nil)
 
 	if response.StatusCode != http.StatusUnauthorized {
 		result.Passed = false
@@ -91,7 +92,7 @@ func CCC_C04_TR01_T03() (result raidengine.MovementResult) {
 		return
 	}
 
-	confirmHTTPResponseIsLogged(response, storageAccountResourceId, logsClient, &result)
+	confirmHTTPResponseIsLogged(response, storageAccount.Id, globals.getLogsClient(), &result)
 	return
 }
 
@@ -149,7 +150,8 @@ func confirmHTTPResponseIsLogged(response *http.Response, resourceId string, log
 	result.Message = fmt.Sprintf("%d response from %v was not logged", response.StatusCode, response.Request.URL)
 }
 
-func confirmLoggingToLogAnalyticsIsConfigured(resourceId string, armMonitorClientFactory *armmonitor.ClientFactory, result *raidengine.MovementResult) {
+func confirmLoggingToLogAnalyticsIsConfigured(resourceId string, result *raidengine.MovementResult) {
+	armMonitorClientFactory := globals.getArmMonitorClientFactory()
 	pager := armMonitorClientFactory.NewDiagnosticSettingsClient().NewListPager(resourceId, nil)
 
 	for pager.More() {
